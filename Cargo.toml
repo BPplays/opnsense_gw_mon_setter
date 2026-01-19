@@ -1,0 +1,13 @@
+[package]
+name = "opnsense_gw_mon_setter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+chrono = "0.4.43"
+humantime-serde = "1.1.1"
+parking_lot = "0.12.5"
+serde = "1.0.228"
+serde_yaml = "0.9.34"
+trippy-core = "0.13.0"
