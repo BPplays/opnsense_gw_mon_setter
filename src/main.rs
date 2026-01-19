@@ -266,26 +266,26 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
         // --- For each configured probe, pick candidates among hosts that replied to that probe's targets ---
         for probe in probes.iter() {
             // compute set of target IPs for this probe (same logic tracer used)
-            // let ips_to_try: Vec<IpAddr> = probe.ips.as_ref()
-            //     .map(|v| v.iter().filter_map(|s| s.parse().ok()).collect())
-            //     .unwrap_or_else(|| vec![
-            //         "2620:fe::9".parse().unwrap(),
-            //         "2001:4860:4860::8888".parse().unwrap(),
-            //     ]);
+            let ips_to_try: Vec<IpAddr> = probe.ips.as_ref()
+                .map(|v| v.iter().filter_map(|s| s.parse().ok()).collect())
+                .unwrap_or_else(|| vec![
+                    "2620:fe::9".parse().unwrap(),
+                    "2001:4860:4860::8888".parse().unwrap(),
+                ]);
 
-            // // We consider only rounds whose target is one of the probe's ips.
-            // // Gather hosts that have any data from those rounds:
-            // let mut hosts_for_probe: HashSet<IpAddr> = HashSet::new();
-            // for round in snapshot.iter().filter(|r| ips_to_try.contains(&r.target)) {
-            //     for probe_res in round.probes.iter() {
-            //         if let ProbeKind::Complete { host, .. } = &probe_res.kind {
-            //             hosts_for_probe.insert(*host);
-            //         }
-            //     }
-            // }
+            // We consider only rounds whose target is one of the probe's ips.
+            // Gather hosts that have any data from those rounds:
+            let mut hosts_for_probe: HashSet<IpAddr> = HashSet::new();
+            for round in snapshot.iter().filter(|r| ips_to_try.contains(&r.target)) {
+                for probe_res in round.probes.iter() {
+                    if let ProbeKind::Complete { host, .. } = &probe_res.kind {
+                        hosts_for_probe.insert(*host);
+                    }
+                }
+            }
 
             // Prepare candidate vector: (host, avg_rtt, avg_loss, min_hops)
-            let mut candidates: Vec<(IpAddr, Duration, f64, u32)> = probe.ips.iter().filter_map(|&host| {
+            let mut candidates: Vec<(IpAddr, Duration, f64, u32)> = hosts_for_probe.iter().filter_map(|&host| {
                 let avg_rtt = host_avg_rtt.get(&host).copied().unwrap_or_else(|| Duration::from_millis(0));
                 // only consider hosts that meet max_rtt
                 if avg_rtt > probe.max_rtt {
