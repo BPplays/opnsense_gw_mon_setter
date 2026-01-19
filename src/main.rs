@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
+use clap::{Parser};
 
 use trippy_core::{Builder, ProbeStatus, Round};
 
@@ -15,6 +16,14 @@ use trippy_core::{Builder, ProbeStatus, Round};
 struct Config {
     #[serde(flatten)]
     ifaces: HashMap<String, Vec<ProbeCfg>>,
+}
+
+#[derive(Parser)]
+#[command(name = "opnsense_gw_mon_setter")]
+#[command(about = "opnsense_gw_mon_setter", long_about = None)]
+struct Cli {
+    #[arg(short = 'c', long = "config", default_value = "config.yml")]
+    config: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -73,8 +82,8 @@ struct TraceRound {
 type SharedList = Arc<Mutex<VecDeque<TraceRound>>>;
 
 fn main() -> Result<()> {
-    // load config.yml from current dir
-    let yaml = std::fs::read_to_string("config.yml")?;
+    let cli = Cli::parse();
+    let yaml = std::fs::read_to_string(cli.config)?;
     let cfg: Config = serde_yaml::from_str(&yaml)?;
 
     // For each interface we create a shared list and spawn a tracer + aggregator thread pair.
