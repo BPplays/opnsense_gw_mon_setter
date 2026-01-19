@@ -28,9 +28,12 @@ struct ProbeCfg {
     #[serde(with = "humantime_serde")]
     #[serde(default = "default_keep_for")]
     keep_for: Duration,
+    #[serde(default = "default_min_ttl")]
+    min_ttl: u8,
 }
 
 fn default_keep_for() -> Duration { Duration::from_secs(30) }
+fn default_min_ttl() -> u8 { 0 }
 
 #[derive(Debug, Clone)]
 struct TraceRecord {
@@ -113,20 +116,23 @@ fn tracer_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) -> R
 
                 // Build tracer bound to interface and run exactly one round synchronously.
                 let builder = Builder::new(target)
-                    .interface(Some(ifname.as_str()))
+                    // .interface(Some(ifname.as_str()))
                     .max_rounds(max_rounds_one);
 
                 match builder.build() {
                     Ok(tracer) => {
-                        println!("Built tracer OK for {}", target);
+                        // println!("Built tracer OK for {}", target);
 
                         // run_with is synchronous and returns a Result — check it!
                         let run_res = tracer.run_with(|round: &Round<'_>| {
                             // this should always print when the closure is invoked
-                            println!("run_with closure entered for target={}", target);
+                            // println!("run_with closure entered for target={}", target);
 
-                            if let Some(rec) = round_to_trace_record(round) {
-                                println!("got TraceRecord for {}: {:?}", target, rec);
+                            if let Some(rec) = round_to_trace_record(
+                                round,
+                                probe.clone(),
+                            ) {
+                                // println!("got TraceRecord for {}: {:?}", target, rec);
                                 // push to shared list and evict old entries older than keep_for
                                 {
                                     let mut q = shared_cloned.lock();
@@ -144,7 +150,10 @@ fn tracer_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) -> R
                         });
 
                         match run_res {
-                            Ok(_) => println!("run_with returned Ok for {}", target),
+                            Ok(_) => {
+                                // println!("run_with returned Ok for {}", target);
+                                break
+                            }
                             Err(e) => {
                                 eprintln!("run_with returned Err for {} on iface {}: {:#}", target, ifname, e);
                             }
@@ -227,10 +236,10 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
 }
 
 /// Map a Round -> TraceRecord (returns None if no Complete probes)
-fn round_to_trace_record(round: &Round<'_>) -> Option<TraceRecord> {
+fn round_to_trace_record(round: &Round<'_>, cfg: ProbeCfg) -> Option<TraceRecord> {
     let total = round.probes.len();
     if total == 0 {
-        println!("rttr: none");
+        // println!("rttr: none");
         return None;
     }
 
@@ -240,19 +249,24 @@ fn round_to_trace_record(round: &Round<'_>) -> Option<TraceRecord> {
     let mut host_for_largest_ttl: Option<IpAddr> = None;
 
     // TimeToLive is a newtype; use .0 to access inner. If your version differs, adjust.
-    let largest_ttl_u32: u32 = (round.largest_ttl.0 as u32);
+    let mut lowest_ttl: u8 = 255;
 
     for p in round.probes.iter() {
-        println!("rttr: p {:#?}", p);
+        // println!("rttr: p {:#?}", p);
         match p {
             ProbeStatus::Complete(pc) => {
+                if pc.ttl.0 < cfg.min_ttl {
+                    continue;
+                }
+                // println!("rttr: p: host {:#?}; ttl: {}", pc.host, pc.ttl.0);
                 // compute rtt if possible
                 if let Ok(dur) = pc.received.duration_since(pc.sent) {
                     rtt_sum_micros += dur.as_micros();
                     complete_count += 1;
                 }
                 last_complete_host = Some(pc.host);
-                if (pc.ttl.0 as u32) == largest_ttl_u32 {
+                if pc.ttl.0 < lowest_ttl {
+                    lowest_ttl = pc.ttl.0;
                     host_for_largest_ttl = Some(pc.host);
                 }
             }
@@ -272,6 +286,8 @@ fn round_to_trace_record(round: &Round<'_>) -> Option<TraceRecord> {
     let awaited = round.probes.iter().filter(|x| matches!(x, ProbeStatus::Awaited(_))).count();
     let loss_percent = (awaited as f64) / (total as f64) * 100.0;
 
+
+    let largest_ttl_u32: u32 = round.largest_ttl.0 as u32;
     let hops = largest_ttl_u32;
 
     Some(TraceRecord {
