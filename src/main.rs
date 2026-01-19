@@ -118,11 +118,16 @@ fn tracer_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) -> R
 
                 match builder.build() {
                     Ok(tracer) => {
-                        // run one round and handle it inline
+                        println!("Built tracer OK for {}", target);
+
+                        // run_with is synchronous and returns a Result — check it!
                         let run_res = tracer.run_with(|round: &Round<'_>| {
+                            // this should always print when the closure is invoked
+                            println!("run_with closure entered for target={}", target);
+
                             if let Some(rec) = round_to_trace_record(round) {
+                                println!("got TraceRecord for {}: {:?}", target, rec);
                                 // push to shared list and evict old entries older than keep_for
-                                println!("pfhsdjf");
                                 {
                                     let mut q = shared_cloned.lock();
                                     q.push_back(rec);
@@ -132,32 +137,24 @@ fn tracer_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) -> R
                                     }
                                 }
                                 had_result_cloned.store(true, Ordering::SeqCst);
+                            } else {
+                                // closure ran but no Complete probes -> helpful to know
+                                println!("closure ran but round_to_trace_record returned None (no Complete probes)");
                             }
                         });
 
-                        if let Err(e) = run_res {
-                            eprintln!("tracer run error for target {} on iface {}: {:#}", target, ifname, e);
-                            // treat as failure and try next IP
-                            continue;
+                        match run_res {
+                            Ok(_) => println!("run_with returned Ok for {}", target),
+                            Err(e) => {
+                                eprintln!("run_with returned Err for {} on iface {}: {:#}", target, ifname, e);
+                            }
                         }
-
-                        // run_with returned; check if we got a result
-                        if had_result.load(Ordering::SeqCst) {
-                            println!("tracer ok3");
-                            succeeded_for_probe = true;
-                            break; // stop trying other IPs for this probe until next cycle
-                        } else {
-                            // no result, try next IP
-                            println!("tracer cont");
-                            continue;
-                        }
-
                     }
                     Err(e) => {
                         eprintln!("failed to build tracer for {} on iface {}: {:#}", target, ifname, e);
-                        continue;
                     }
                 }
+
             } // end for ips
 
             if !succeeded_for_probe {
@@ -233,6 +230,7 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
 fn round_to_trace_record(round: &Round<'_>) -> Option<TraceRecord> {
     let total = round.probes.len();
     if total == 0 {
+        println!("rttr: none");
         return None;
     }
 
@@ -245,6 +243,7 @@ fn round_to_trace_record(round: &Round<'_>) -> Option<TraceRecord> {
     let largest_ttl_u32: u32 = (round.largest_ttl.0 as u32);
 
     for p in round.probes.iter() {
+        println!("rttr: p {:#?}", p);
         match p {
             ProbeStatus::Complete(pc) => {
                 // compute rtt if possible
