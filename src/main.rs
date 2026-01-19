@@ -149,7 +149,7 @@ fn tracer_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) -> R
 
                 // Build tracer bound to interface and run exactly one round synchronously.
                 let builder = Builder::new(target)
-                    // .interface(Some(ifname.as_str()))
+                    .interface(Some(ifname.as_str()))
                     .max_rounds(max_rounds_one);
 
                 match builder.build() {
