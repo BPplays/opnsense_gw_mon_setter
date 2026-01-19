@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::Deserialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,16 +35,33 @@ struct ProbeCfg {
 fn default_keep_for() -> Duration { Duration::from_secs(30) }
 fn default_min_ttl() -> u8 { 0 }
 
+/// Owned representation of a single probe result inside a round.
+/// We store the probe's *index* so we can compute per-ttl-index loss
+/// even if the non-Complete probe variants don't expose TTL directly.
 #[derive(Debug, Clone)]
-struct TraceRecord {
-    ip: IpAddr,
-    ts: DateTime<Utc>,
-    rtt: Duration,
-    loss: f64,   // percent 0.0 .. 100.0
-    hops: u32,
+enum ProbeKind {
+    Complete { host: IpAddr, ttl: u8, rtt: Duration },
+    Awaited,
+    Other,
 }
 
-type SharedList = Arc<Mutex<VecDeque<TraceRecord>>>;
+#[derive(Debug, Clone)]
+struct ProbeResult {
+    index: usize,
+    kind: ProbeKind,
+}
+
+#[derive(Debug, Clone)]
+struct TraceRound {
+    /// the target we probed (destination IP)
+    target: IpAddr,
+    ts: DateTime<Utc>,
+    probes: Vec<ProbeResult>,
+    /// largest_ttl observed in that round (copied from Round.largest_ttl)
+    largest_ttl: u8,
+}
+
+type SharedList = Arc<Mutex<VecDeque<TraceRound>>>;
 
 fn main() -> Result<()> {
     // load config.yml from current dir
@@ -101,11 +118,9 @@ fn tracer_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) -> R
                 .map(|v| v.iter().filter_map(|s| s.parse().ok()).collect())
                 .unwrap_or_else(|| default_ips.clone());
 
-            let mut succeeded_for_probe = false;
-
             for target in ips_to_try.into_iter() {
                 println!("tracing: {}", target);
-                // had_result flag will be set inside the run_with closure if a TraceRecord was produced/pushed
+                // had_result flag will be set inside the run_with closure if a TraceRound was produced/pushed
                 let had_result = Arc::new(AtomicBool::new(false));
                 let had_result_cloned = had_result.clone();
                 let shared_cloned = shared.clone();
@@ -121,38 +136,25 @@ fn tracer_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) -> R
 
                 match builder.build() {
                     Ok(tracer) => {
-                        // println!("Built tracer OK for {}", target);
-
                         // run_with is synchronous and returns a Result — check it!
                         let run_res = tracer.run_with(|round: &Round<'_>| {
-                            // this should always print when the closure is invoked
-                            // println!("run_with closure entered for target={}", target);
-
-                            if let Some(rec) = round_to_trace_record(
-                                round,
-                                probe.clone(),
-                            ) {
-                                // println!("got TraceRecord for {}: {:?}", target, rec);
-                                // push to shared list and evict old entries older than keep_for
-                                {
-                                    let mut q = shared_cloned.lock();
-                                    q.push_back(rec);
-                                    let cutoff = chrono::Utc::now() - chrono::Duration::from_std(keep_for).unwrap();
-                                    while q.front().map(|r| r.ts < cutoff).unwrap_or(false) {
-                                        q.pop_front();
-                                    }
+                            // convert the round to our owned TraceRound (always returns one even if no Complete)
+                            let tr = round_to_trace_round(round, probe.clone(), target);
+                            {
+                                let mut q = shared_cloned.lock();
+                                q.push_back(tr);
+                                let cutoff = chrono::Utc::now() - chrono::Duration::from_std(keep_for).unwrap();
+                                while q.front().map(|r| r.ts < cutoff).unwrap_or(false) {
+                                    q.pop_front();
                                 }
-                                had_result_cloned.store(true, Ordering::SeqCst);
-                            } else {
-                                // closure ran but no Complete probes -> helpful to know
-                                println!("closure ran but round_to_trace_record returned None (no Complete probes)");
                             }
+                            had_result_cloned.store(true, Ordering::SeqCst);
                         });
 
                         match run_res {
                             Ok(_) => {
                                 // println!("run_with returned Ok for {}", target);
-                                break
+                                // move to next target (or next probe)
                             }
                             Err(e) => {
                                 eprintln!("run_with returned Err for {} on iface {}: {:#}", target, ifname, e);
@@ -165,11 +167,6 @@ fn tracer_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) -> R
                 }
 
             } // end for ips
-
-            if !succeeded_for_probe {
-                // nothing responded for this probe: you can log if desired
-                // eprintln!("no IPs responded for probe {} on {}", probe.name, ifname);
-            }
 
             // short pause between probes to avoid tight loop (tweak as needed)
             thread::sleep(Duration::from_secs(1));
@@ -187,7 +184,7 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
     loop {
         thread::sleep(poll_interval);
 
-        let snapshot: Vec<TraceRecord> = {
+        let snapshot: Vec<TraceRound> = {
             let q = shared.lock();
             q.iter().cloned().collect()
         };
@@ -196,31 +193,108 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
             continue;
         }
 
-        // group by ip
-        let mut per_ip: HashMap<IpAddr, Vec<TraceRecord>> = HashMap::new();
-        for rec in snapshot.into_iter() {
-            per_ip.entry(rec.ip).or_default().push(rec);
+        // --- Build global aggregation structures ---
+        // total_probes_at_index[i] = how many rounds contained a probe at index i
+        let mut total_probes_at_index: HashMap<usize, usize> = HashMap::new();
+        // successes[(host, index)] = number of times host replied at that probe index
+        let mut successes: HashMap<(IpAddr, usize), usize> = HashMap::new();
+        // rtts per host (for avg RTT)
+        let mut rtts: HashMap<IpAddr, Vec<Duration>> = HashMap::new();
+        // min hops per host
+        let mut min_hops: HashMap<IpAddr, u32> = HashMap::new();
+        // set of hosts seen
+        let mut seen_hosts: HashSet<IpAddr> = HashSet::new();
+
+        for round in snapshot.iter() {
+            for probe_res in round.probes.iter() {
+                // each probe index counts as "one attempt" (the probe was sent)
+                *total_probes_at_index.entry(probe_res.index).or_insert(0) += 1;
+
+                match &probe_res.kind {
+                    ProbeKind::Complete { host, ttl: _, rtt } => {
+                        seen_hosts.insert(*host);
+                        *successes.entry((*host, probe_res.index)).or_insert(0) += 1;
+                        rtts.entry(*host).or_default().push(*rtt);
+                        let hops_val = round.largest_ttl as u32;
+                        min_hops.entry(*host).and_modify(|m| *m = (*m).min(hops_val)).or_insert(hops_val);
+                    }
+                    _ => {
+                        // Awaited / Other -> simply counts toward totals at that index (i.e. potential loss)
+                    }
+                }
+            }
         }
 
-        // compute summaries
-        let summaries: Vec<(IpAddr, Duration, f64, u32)> = per_ip.into_iter()
-            .map(|(ip, vec)| {
-                let n = vec.len() as f64;
-                let avg_rtt_ms = vec.iter().map(|r| r.rtt.as_millis() as f64).sum::<f64>() / n;
-                let avg_rtt = Duration::from_millis(avg_rtt_ms.round() as u64);
-                let avg_loss = vec.iter().map(|r| r.loss).sum::<f64>() / n;
-                let min_hops = vec.iter().map(|r| r.hops).min().unwrap_or(255);
-                (ip, avg_rtt, avg_loss, min_hops)
-            })
-            .collect();
+        // --- compute per-host-per-index loss and overall stats ---
+        // per-host-per-index loss: loss% = 100 * (1 - successes / total_for_index)
+        let mut per_host_index_loss: HashMap<(IpAddr, usize), f64> = HashMap::new();
+        for &host in seen_hosts.iter() {
+            for (&index, &total_for_index) in total_probes_at_index.iter() {
+                let suc = successes.get(&(host, index)).copied().unwrap_or(0) as f64;
+                let tot = total_for_index as f64;
+                let loss = if tot > 0.0 { (1.0 - suc / tot) * 100.0 } else { 100.0 };
+                per_host_index_loss.insert((host, index), loss);
+            }
+        }
 
-        // For each configured probe on this interface, find valid entries <= probe.max_rtt,
-        // sort by loss then hops, and print the winner.
+        // per-host aggregate loss (average of index losses weighted by totals at each index)
+        let mut host_aggregate_loss: HashMap<IpAddr, f64> = HashMap::new();
+        for &host in seen_hosts.iter() {
+            let mut weighted_sum = 0.0f64;
+            let mut weight = 0.0f64;
+            for (&index, &total_for_index) in total_probes_at_index.iter() {
+                let tot = total_for_index as f64;
+                if tot == 0.0 { continue; }
+                let loss = per_host_index_loss.get(&(host, index)).copied().unwrap_or(100.0);
+                weighted_sum += loss * tot;
+                weight += tot;
+            }
+            let avg = if weight > 0.0 { weighted_sum / weight } else { 100.0 };
+            host_aggregate_loss.insert(host, avg);
+        }
+
+        // compute avg RTT per host
+        let mut host_avg_rtt: HashMap<IpAddr, Duration> = HashMap::new();
+        for (&host, vec) in rtts.iter() {
+            if !vec.is_empty() {
+                let sum_micros: u128 = vec.iter().map(|d| d.as_micros() as u128).sum();
+                let avg_micros = (sum_micros as f64 / vec.len() as f64).round() as u128;
+                host_avg_rtt.insert(host, Duration::from_micros(avg_micros as u64));
+            }
+        }
+
+        // --- For each configured probe, pick candidates among hosts that replied to that probe's targets ---
         for probe in probes.iter() {
-            let mut candidates: Vec<_> = summaries.iter()
-                .filter(|(_, avg_rtt, _, _)| *avg_rtt <= probe.max_rtt)
-                .cloned()
-                .collect();
+            // compute set of target IPs for this probe (same logic tracer used)
+            // let ips_to_try: Vec<IpAddr> = probe.ips.as_ref()
+            //     .map(|v| v.iter().filter_map(|s| s.parse().ok()).collect())
+            //     .unwrap_or_else(|| vec![
+            //         "2620:fe::9".parse().unwrap(),
+            //         "2001:4860:4860::8888".parse().unwrap(),
+            //     ]);
+
+            // // We consider only rounds whose target is one of the probe's ips.
+            // // Gather hosts that have any data from those rounds:
+            // let mut hosts_for_probe: HashSet<IpAddr> = HashSet::new();
+            // for round in snapshot.iter().filter(|r| ips_to_try.contains(&r.target)) {
+            //     for probe_res in round.probes.iter() {
+            //         if let ProbeKind::Complete { host, .. } = &probe_res.kind {
+            //             hosts_for_probe.insert(*host);
+            //         }
+            //     }
+            // }
+
+            // Prepare candidate vector: (host, avg_rtt, avg_loss, min_hops)
+            let mut candidates: Vec<(IpAddr, Duration, f64, u32)> = probe.ips.iter().filter_map(|&host| {
+                let avg_rtt = host_avg_rtt.get(&host).copied().unwrap_or_else(|| Duration::from_millis(0));
+                // only consider hosts that meet max_rtt
+                if avg_rtt > probe.max_rtt {
+                    return None;
+                }
+                let avg_loss = host_aggregate_loss.get(&host).copied().unwrap_or(100.0);
+                let hops = min_hops.get(&host).copied().unwrap_or(255u32);
+                Some((host, avg_rtt, avg_loss, hops))
+            }).collect();
 
             candidates.sort_by(|a, b| {
                 a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal)
@@ -228,73 +302,69 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
             });
 
             println!("iface={} probe={} candidates={}", ifname, probe.name, candidates.len());
-            for (ip, avg_rtt, avg_loss, hops) in candidates.iter().take(5) {
+            for (ip, avg_rtt, avg_loss, hops) in candidates.iter() {
                 println!("  {} avg_rtt={:?} avg_loss={:.2}% hops={}", ip, avg_rtt, avg_loss, hops);
             }
+
+            // // Additionally, print per-index loss for top N hosts (useful to see how loss varies by TTL index)
+            // for (ip, _, _, _) in candidates.iter().take(5) {
+            //     print!("  per-index loss for {}: ", ip);
+            //     // show losses sorted by index
+            //     let mut pairs: Vec<(usize, f64)> = total_probes_at_index.keys().map(|&idx| {
+            //         let l = per_host_index_loss.get(&(*ip, idx)).copied().unwrap_or(100.0);
+            //         (idx, l)
+            //     }).collect();
+            //     pairs.sort_by_key(|p| p.0);
+            //     let brief: Vec<String> = pairs.into_iter().map(|(i, l)| format!("[idx {}: {:.1}%]", i, l)).collect();
+            //     println!("{}", brief.join(" "));
+            // }
         }
     }
 }
 
-/// Map a Round -> TraceRecord (returns None if no Complete probes)
-fn round_to_trace_record(round: &Round<'_>, cfg: ProbeCfg) -> Option<TraceRecord> {
-    let total = round.probes.len();
-    if total == 0 {
-        // println!("rttr: none");
-        return None;
-    }
-
-    let mut complete_count = 0usize;
-    let mut rtt_sum_micros: u128 = 0;
-    let mut last_complete_host: Option<IpAddr> = None;
-    let mut host_for_largest_ttl: Option<IpAddr> = None;
-
-    // TimeToLive is a newtype; use .0 to access inner. If your version differs, adjust.
-    let mut lowest_ttl: u8 = 255;
-
-    for p in round.probes.iter() {
-        // println!("rttr: p {:#?}", p);
+/// Convert a trippy-core Round<'_> into an owned TraceRound (always returns a TraceRound).
+/// Note: we record the probe *index* for each probe result so the aggregator can compute
+/// per-index (per-TTL-index) loss even if non-Complete variants don't expose TTL directly.
+fn round_to_trace_round(round: &Round<'_>, cfg: ProbeCfg, target: IpAddr) -> TraceRound {
+    let mut probes: Vec<ProbeResult> = Vec::with_capacity(round.probes.len());
+    for (idx, p) in round.probes.iter().enumerate() {
         match p {
             ProbeStatus::Complete(pc) => {
-                if pc.ttl.0 < cfg.min_ttl {
-                    continue;
-                }
-                // println!("rttr: p: host {:#?}; ttl: {}", pc.host, pc.ttl.0);
                 // compute rtt if possible
-                if let Ok(dur) = pc.received.duration_since(pc.sent) {
-                    rtt_sum_micros += dur.as_micros();
-                    complete_count += 1;
-                }
-                last_complete_host = Some(pc.host);
-                if pc.ttl.0 < lowest_ttl {
-                    lowest_ttl = pc.ttl.0;
-                    host_for_largest_ttl = Some(pc.host);
-                }
+                let kind = if let Ok(dur) = pc.received.duration_since(pc.sent) {
+                    ProbeKind::Complete {
+                        host: pc.host,
+                        ttl: pc.ttl.0,
+                        rtt: dur,
+                    }
+                } else {
+                    // if time travel / clocks make duration_since fail, mark as Other
+                    ProbeKind::Other
+                };
+                probes.push(ProbeResult {
+                    index: idx,
+                    kind,
+                });
             }
-            _ => {}
+            ProbeStatus::Awaited(_) => {
+                probes.push(ProbeResult {
+                    index: idx,
+                    kind: ProbeKind::Awaited,
+                });
+            }
+            _ => {
+                probes.push(ProbeResult {
+                    index: idx,
+                    kind: ProbeKind::Other,
+                });
+            }
         }
     }
 
-    if complete_count == 0 {
-        return None;
-    }
-
-    let chosen_ip = host_for_largest_ttl.or(last_complete_host).expect("complete_count > 0 so there is a host");
-
-    let avg_rtt_micros = (rtt_sum_micros as f64 / complete_count as f64).round() as u128;
-    let avg_rtt = Duration::from_micros(avg_rtt_micros as u64);
-
-    let awaited = round.probes.iter().filter(|x| matches!(x, ProbeStatus::Awaited(_))).count();
-    let loss_percent = (awaited as f64) / (total as f64) * 100.0;
-
-
-    let largest_ttl_u32: u32 = round.largest_ttl.0 as u32;
-    let hops = largest_ttl_u32;
-
-    Some(TraceRecord {
-        ip: chosen_ip,
+    TraceRound {
+        target,
         ts: chrono::Utc::now(),
-        rtt: avg_rtt,
-        loss: loss_percent,
-        hops,
-    })
+        probes,
+        largest_ttl: round.largest_ttl.0,
+    }
 }
