@@ -184,7 +184,8 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
     loop {
         thread::sleep(poll_interval);
 
-        let snapshot: Vec<TraceRound> = {
+        // snapshot the rounds
+        let mut snapshot: Vec<TraceRound> = {
             let q = shared.lock();
             q.iter().cloned().collect()
         };
@@ -193,20 +194,20 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
             continue;
         }
 
-        // Determine maximum probe index present so we can allocate indexed vectors.
+        // make ordering deterministic by timestamp (oldest first)
+        snapshot.sort_by_key(|r| r.ts);
+
+        let total_rounds = snapshot.len() as f64;
+
+        // Determine maximum probe index present so we can allocate indexed vectors (still useful).
         let max_index = snapshot.iter()
             .flat_map(|r| r.probes.iter().map(|p| p.index))
             .max()
             .unwrap_or(0);
         let index_count = max_index + 1;
 
-        // total_probes_at_index[i] = how many rounds contained a probe at index i
-        let mut total_probes_at_index: Vec<usize> = vec![0; index_count];
-
-        // ordered list of hosts in first-seen order
+        // Build FIRST-SEEN ordered host list (chronological across rounds)
         let mut seen_hosts: Vec<IpAddr> = Vec::new();
-
-        // first pass: collect ordered hosts (only from Complete entries)
         for round in snapshot.iter() {
             for probe_res in round.probes.iter() {
                 if let ProbeKind::Complete { host, .. } = &probe_res.kind {
@@ -217,79 +218,72 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
             }
         }
 
-        // prepare per-host structures indexed by host_idx (index into seen_hosts)
-        // Note: we'll allow these vectors to grow if we encounter a brand-new host during the second pass.
-        let mut successes: Vec<Vec<usize>> = vec![vec![0; index_count]; seen_hosts.len()];
-        let mut rtts: Vec<Vec<Duration>> = vec![Vec::new(); seen_hosts.len()];
-        let mut min_hops: Vec<Option<u32>> = vec![None; seen_hosts.len()];
+        let host_count = seen_hosts.len();
 
-        // second pass: fill totals, successes, rtts, min_hops
+        // Per-host accumulators indexed by host index:
+        // - times_present: number of rounds where host appeared at least once
+        // - index_sum: sum of the (closest) indices where the host appeared (for average position)
+        // - rtts: list of RTT samples for avg RTT
+        // - min_hops: minimum hops observed for host
+        let mut times_present: Vec<usize> = vec![0; host_count];
+        let mut index_sum: Vec<usize> = vec![0; host_count];
+        let mut rtts: Vec<Vec<Duration>> = vec![Vec::new(); host_count];
+        let mut min_hops: Vec<Option<u32>> = vec![None; host_count];
+
+        // For each round, note which hosts appeared and their closest index in that round.
         for round in snapshot.iter() {
+            // Map host_idx -> closest index for this round (we'll compute with temporary vec)
+            // Use Option<usize> to mark presence.
+            let mut round_closest: Vec<Option<usize>> = vec![None; host_count];
+
             for probe_res in round.probes.iter() {
-                // count that this probe index was attempted
-                if probe_res.index < index_count {
-                    total_probes_at_index[probe_res.index] += 1;
-                }
-                match &probe_res.kind {
-                    ProbeKind::Complete { host, ttl: _, rtt } => {
-                        // inline position lookup so the borrow doesn't live across mutation
-                        if let Some(hidx) = seen_hosts.iter().position(|h| h == host) {
-                            successes[hidx][probe_res.index] += 1;
-                            rtts[hidx].push(*rtt);
-                            let hops_val = round.largest_ttl as u32;
-                            min_hops[hidx] = Some(min_hops[hidx].map(|m| m.min(hops_val)).unwrap_or(hops_val));
-                        } else {
-                            // This host wasn't in the first-seen list (unlikely), append it and grow vectors.
-                            seen_hosts.push(*host);
-                            let new_idx = seen_hosts.len() - 1;
-                            successes.push(vec![0; index_count]);
-                            rtts.push(Vec::new());
-                            min_hops.push(None);
-                            successes[new_idx][probe_res.index] = 1;
-                            rtts[new_idx].push(*rtt);
-                            min_hops[new_idx] = Some(round.largest_ttl as u32);
-                        }
-                    }
-                    _ => {
-                        // Awaited / Other -> no success increment; still counted in totals above
+                if let ProbeKind::Complete { host, ttl: _, rtt } = &probe_res.kind {
+                    if let Some(hidx) = seen_hosts.iter().position(|h| h == host) {
+                        // update closest index for this round
+                        round_closest[hidx] = Some(match round_closest[hidx] {
+                            Some(existing) => existing.min(probe_res.index),
+                            None => probe_res.index,
+                        });
+                        // collect RTT samples and hops (we collect every sample; presence counted once per round below)
+                        rtts[hidx].push(*rtt);
+                        let hops_val = round.largest_ttl as u32;
+                        min_hops[hidx] = Some(min_hops[hidx].map(|m| m.min(hops_val)).unwrap_or(hops_val));
                     }
                 }
             }
-        }
 
-        // compute per-host-per-index loss and overall stats using indexed vectors
-        // per_host_index_loss[host_idx][index] = loss% (0..100)
-        let mut per_host_index_loss: Vec<Vec<f64>> = vec![vec![100.0; index_count]; seen_hosts.len()];
-        for hidx in 0..seen_hosts.len() {
-            for idx in 0..index_count {
-                let tot = total_probes_at_index[idx] as f64;
-                if tot > 0.0 {
-                    let suc = successes[hidx][idx] as f64;
-                    per_host_index_loss[hidx][idx] = (1.0 - suc / tot) * 100.0;
-                } else {
-                    per_host_index_loss[hidx][idx] = 100.0;
+            // Now increment times_present and index_sum for hosts that appeared in this round
+            for hidx in 0..host_count {
+                if let Some(idx) = round_closest[hidx] {
+                    times_present[hidx] += 1;
+                    index_sum[hidx] += idx;
                 }
             }
         }
 
-        // per-host aggregate loss (weighted by total attempts per index)
-        let mut host_aggregate_loss: Vec<f64> = vec![100.0; seen_hosts.len()];
-        for hidx in 0..seen_hosts.len() {
-            let mut weighted_sum = 0.0f64;
-            let mut weight = 0.0f64;
-            for idx in 0..index_count {
-                let tot = total_probes_at_index[idx] as f64;
-                if tot == 0.0 { continue; }
-                let loss = per_host_index_loss[hidx][idx];
-                weighted_sum += loss * tot;
-                weight += tot;
-            }
-            host_aggregate_loss[hidx] = if weight > 0.0 { weighted_sum / weight } else { 100.0 };
-        }
+        // Compute per-host metrics:
+        // - loss = 100 * (1 - times_present / total_rounds)
+        // - avg_index = index_sum / times_present (or large sentinel if times_present == 0)
+        // - avg_rtt from rtts vector (or None)
+        let mut host_loss: Vec<f64> = vec![100.0; host_count];
+        let mut host_avg_index: Vec<f64> = vec![f64::INFINITY; host_count];
+        let mut host_avg_rtt: Vec<Option<Duration>> = vec![None; host_count];
 
-        // compute avg RTT per host
-        let mut host_avg_rtt: Vec<Option<Duration>> = vec![None; seen_hosts.len()];
-        for hidx in 0..seen_hosts.len() {
+        for hidx in 0..host_count {
+            let present = times_present[hidx] as f64;
+            if total_rounds > 0.0 {
+                host_loss[hidx] = (1.0 - present / total_rounds) * 100.0;
+            } else {
+                host_loss[hidx] = 100.0;
+            }
+
+            if times_present[hidx] > 0 {
+                host_avg_index[hidx] = index_sum[hidx] as f64 / times_present[hidx] as f64;
+            } else {
+                // host never seen -> place it at the far end
+                host_avg_index[hidx] = f64::INFINITY;
+            }
+
             if !rtts[hidx].is_empty() {
                 let sum_micros: u128 = rtts[hidx].iter().map(|d| d.as_micros() as u128).sum();
                 let avg_micros = (sum_micros as f64 / rtts[hidx].len() as f64).round() as u128;
@@ -297,50 +291,42 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
             }
         }
 
-        // --- For each configured probe, pick candidates among all seen hosts (all rounds are fair game) ---
+        // --- For each configured probe, build candidates sorted by avg_index (closest -> furthest) ---
         for probe in probes.iter() {
-            // compute set of target IPs for this probe (same logic tracer used) - kept for informational parity
-            let ips_to_try: Vec<IpAddr> = probe.ips.as_ref()
-                .map(|v| v.iter().filter_map(|s| s.parse().ok()).collect())
-                .unwrap_or_else(|| vec![
-                    "2620:fe::9".parse().unwrap(),
-                    "2001:4860:4860::8888".parse().unwrap(),
-                ]);
-
-            // Hosts for probe: ALL seen hosts (since "all rounds are fair game")
-            let mut candidates: Vec<(IpAddr, Duration, f64, u32, usize)> = Vec::new();
+            // Build list of candidate tuples: (host, avg_rtt, loss, hops, avg_index)
+            let mut candidates: Vec<(IpAddr, Option<Duration>, f64, u32, f64)> = Vec::new();
             for (hidx, host) in seen_hosts.iter().enumerate() {
-                // avg_rtt default to 0 if no samples existed (same behavior as before)
                 let avg_rtt = host_avg_rtt[hidx].unwrap_or_else(|| Duration::from_millis(0));
+                // still respect probe.max_rtt (skip hosts slower than allowed)
                 if avg_rtt > probe.max_rtt {
-                    continue; // respect probe.max_rtt as before
+                    continue;
                 }
-                let avg_loss = host_aggregate_loss[hidx];
+                let loss = host_loss[hidx];
                 let hops = min_hops[hidx].unwrap_or(255u32);
-                candidates.push((*host, avg_rtt, avg_loss, hops, hidx));
+                let avg_idx = host_avg_index[hidx];
+                candidates.push((*host, Some(avg_rtt), loss, hops, avg_idx));
             }
 
-            // sort by loss then hops then original order (host index) to keep deterministic tie-breaking
+            // sort by average index ascending (closest first). tie-break by loss then hops.
             candidates.sort_by(|a, b| {
-                a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal)
+                // compare avg_idx (f64), but handle INFINITY properly
+                let cmp_idx = a.4.partial_cmp(&b.4).unwrap_or(std::cmp::Ordering::Equal);
+                cmp_idx
+                    .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
                     .then_with(|| a.3.cmp(&b.3))
-                    .then_with(|| a.4.cmp(&b.4))
             });
 
             println!("iface={} probe={} candidates={}", ifname, probe.name, candidates.len());
-            for (ip, avg_rtt, avg_loss, hops, _hidx) in candidates.iter() {
-                println!("  {} avg_rtt={:?} avg_loss={:.2}% hops={}", ip, avg_rtt, avg_loss, hops);
+            for (ip, avg_rtt_opt, loss, hops, avg_idx) in candidates.iter() {
+                // unwrap avg_rtt Option (we used Some above) for printing
+                let avg_rtt = avg_rtt_opt.unwrap_or_else(|| Duration::from_millis(0));
+                // print avg_index too for debugging
+                println!("  {} avg_rtt={:?} avg_loss={:.2}% hops={} avg_index={:.2}", ip, avg_rtt, loss, hops, avg_idx);
             }
 
-            // Optionally: print per-index loss for top N hosts (in first-seen order among the sorted candidates)
-            for (ip, _, _, _, hidx) in candidates.iter().take(5) {
-                print!("  per-index loss for {}: ", ip);
-                let mut parts: Vec<String> = Vec::with_capacity(index_count);
-                for idx in 0..index_count {
-                    let l = per_host_index_loss[*hidx][idx];
-                    parts.push(format!("[idx {}: {:.1}%]", idx, l));
-                }
-                println!("{}", parts.join(" "));
+            // print brief per-host summary for top N
+            for (ip, _, loss, _, avg_idx) in candidates.iter().take(8) {
+                println!("  host {} loss={:.2}% avg_pos={:.2}", ip, loss, avg_idx);
             }
         }
     }
