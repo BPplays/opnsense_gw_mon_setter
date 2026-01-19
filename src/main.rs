@@ -218,18 +218,10 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
         }
 
         // prepare per-host structures indexed by host_idx (index into seen_hosts)
-        let host_count = seen_hosts.len();
-        // successes[host_idx][probe_index] = number of times host replied at that probe index
-        let mut successes: Vec<Vec<usize>> = vec![vec![0; index_count]; host_count];
-        // rtts per host (for avg RTT)
-        let mut rtts: Vec<Vec<Duration>> = vec![Vec::new(); host_count];
-        // min hops per host
-        let mut min_hops: Vec<Option<u32>> = vec![None; host_count];
-
-        // helper to get host index (linear search; preserves order and avoids hashmaps)
-        let host_index_of = |host: &IpAddr| -> Option<usize> {
-            seen_hosts.iter().position(|h| h == host)
-        };
+        // Note: we'll allow these vectors to grow if we encounter a brand-new host during the second pass.
+        let mut successes: Vec<Vec<usize>> = vec![vec![0; index_count]; seen_hosts.len()];
+        let mut rtts: Vec<Vec<Duration>> = vec![Vec::new(); seen_hosts.len()];
+        let mut min_hops: Vec<Option<u32>> = vec![None; seen_hosts.len()];
 
         // second pass: fill totals, successes, rtts, min_hops
         for round in snapshot.iter() {
@@ -240,14 +232,14 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
                 }
                 match &probe_res.kind {
                     ProbeKind::Complete { host, ttl: _, rtt } => {
-                        if let Some(hidx) = host_index_of(host) {
+                        // inline position lookup so the borrow doesn't live across mutation
+                        if let Some(hidx) = seen_hosts.iter().position(|h| h == host) {
                             successes[hidx][probe_res.index] += 1;
                             rtts[hidx].push(*rtt);
                             let hops_val = round.largest_ttl as u32;
                             min_hops[hidx] = Some(min_hops[hidx].map(|m| m.min(hops_val)).unwrap_or(hops_val));
                         } else {
-                            // This host wasn't in the first-seen list (unlikely since we seeded from Completes),
-                            // but handle gracefully by pushing it at the end to preserve deterministic order.
+                            // This host wasn't in the first-seen list (unlikely), append it and grow vectors.
                             seen_hosts.push(*host);
                             let new_idx = seen_hosts.len() - 1;
                             successes.push(vec![0; index_count]);
@@ -256,7 +248,6 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
                             successes[new_idx][probe_res.index] = 1;
                             rtts[new_idx].push(*rtt);
                             min_hops[new_idx] = Some(round.largest_ttl as u32);
-                            // update host_count-like variables (not strictly necessary beyond this point)
                         }
                     }
                     _ => {
@@ -276,7 +267,6 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
                     let suc = successes[hidx][idx] as f64;
                     per_host_index_loss[hidx][idx] = (1.0 - suc / tot) * 100.0;
                 } else {
-                    // no probes ever sent at this index -> treat as 100% loss (same as before)
                     per_host_index_loss[hidx][idx] = 100.0;
                 }
             }
@@ -318,7 +308,6 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
                 ]);
 
             // Hosts for probe: ALL seen hosts (since "all rounds are fair game")
-            // We iterate in first-seen order and build candidate list (will be sorted afterward)
             let mut candidates: Vec<(IpAddr, Duration, f64, u32, usize)> = Vec::new();
             for (hidx, host) in seen_hosts.iter().enumerate() {
                 // avg_rtt default to 0 if no samples existed (same behavior as before)
