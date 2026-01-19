@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -34,6 +34,15 @@ struct ProbeCfg {
 
 fn default_keep_for() -> Duration { Duration::from_secs(30) }
 fn default_min_ttl() -> u8 { 0 }
+
+#[derive(Debug, Clone)]
+struct Candidate {
+    ip: IpAddr,
+    avg_rtt: Option<Duration>,
+    loss: f64,
+    hops: u32,
+    avg_index: f64,
+}
 
 /// Owned representation of a single probe result inside a round.
 /// We store the probe's *index* so we can compute per-ttl-index loss
@@ -299,7 +308,8 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
         // --- For each configured probe, build candidates sorted by avg_index (closest -> furthest) ---
         for probe in probes.iter() {
             // Build list of candidate tuples: (host, avg_rtt_opt, loss, hops, avg_index)
-            let mut candidates: Vec<(IpAddr, Option<Duration>, f64, u32, f64)> = Vec::new();
+            // let mut candidates: Vec<(IpAddr, Option<Duration>, f64, u32, f64)> = Vec::new();
+            let mut candidates: Vec<Candidate> = Vec::new();
             for (hidx, host) in seen_hosts.iter().enumerate() {
                 // do not coerce missing RTT to 0 — keep Option so we can show "—"
                 let avg_rtt_opt = host_avg_rtt[hidx];
@@ -312,31 +322,73 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
                 let loss = host_loss[hidx];
                 let hops = min_hops[hidx].unwrap_or(255u32);
                 let avg_idx = host_avg_index[hidx];
-                candidates.push((*host, avg_rtt_opt, loss, hops, avg_idx));
+                // candidates.push((*host, avg_rtt_opt, loss, hops, avg_idx));
+                candidates.push(Candidate {
+                    ip: (host.clone()),
+                    avg_rtt: (avg_rtt_opt),
+                    loss: loss,
+                    hops: hops,
+                    avg_index: (avg_idx),
+                });
             }
 
             // sort by average index ascending (closest first). tie-break by loss then hops.
             candidates.sort_by(|a, b| {
-                let cmp_idx = a.4.partial_cmp(&b.4).unwrap_or(std::cmp::Ordering::Equal);
+                let cmp_idx = a.hops.partial_cmp(&b.hops).unwrap_or(std::cmp::Ordering::Equal);
                 cmp_idx
-                    .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
-                    .then_with(|| a.3.cmp(&b.3))
+                    .then_with(|| a.avg_index.partial_cmp(&b.avg_index).unwrap_or(std::cmp::Ordering::Equal))
+                    .then_with(|| a.loss.total_cmp(&b.loss))
             });
 
             println!("iface={} probe={} candidates={}", ifname, probe.name, candidates.len());
-            for (ip, avg_rtt_opt, loss, hops, avg_idx) in candidates.iter() {
+            for can in candidates.iter() {
                 // show "—" for hosts with no RTT samples
-                let avg_rtt_str = match avg_rtt_opt {
+                let avg_rtt_str = match can.avg_rtt {
                     Some(d) => format!("{:?}", d),
                     None => "—".to_string(),
                 };
-                println!("  {} avg_rtt={} avg_loss={:.2}% hops={} avg_index={:.2}", ip, avg_rtt_str, loss, hops, avg_idx);
+                println!(
+                    "  {} avg_rtt={} avg_loss={:.2}% hops={} avg_index={:.2}",
+                    can.ip,
+                    avg_rtt_str,
+                    can.loss,
+                    can.hops,
+                    can.avg_index,
+                );
             }
 
-            // brief per-host summary for top N
-            for (ip, _, loss, _, avg_idx) in candidates.iter().take(8) {
-                println!("  host {} loss={:.2}% avg_pos={:.2}", ip, loss, avg_idx);
+            // let mut winner = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
+
+            let mut winner = Candidate {
+                ip: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                avg_rtt: Some(Duration::new(0, 0)),
+                loss: 0.0,
+                hops: 0,
+                avg_index: -99999.0,
+            };
+
+            for can in candidates.iter() {
+                let mut ttl = can.avg_index.round() as u8;
+                if ttl < 255 { ttl += 1 }
+
+                if ttl < probe.min_ttl {
+                    println!("ttl too small {}", ttl);
+                    continue;
+                }
+                if winner.ip.is_unspecified() {
+                    winner = can.clone();
+                    continue;
+                }
+
+                if can.avg_rtt > Some(probe.max_rtt) {
+                    continue;
+                }
+
+                if can.loss < winner.loss {
+                    winner = can.clone()
+                }
             }
+            println!("winner! is {}", winner.ip)
         }
     }
 }
