@@ -1,10 +1,14 @@
-"vEthernet (vlan1)":
-  - name: "gw_main"
-    name_selector: "WAN_DHCP6"
-    max_rtt: "100ms"
-    keep_for: "30s"
-    min_ttl: 2
-    ips:
-      # - "2620:fe::9"
-      # - "2001:4860:4860::8888"
-      - "2001:4860:4860::1888"
+api:
+  type: opnsense
+  key: ""
+  secret: ""
+
+ifaces:
+  eth4:
+    - name: gw_main
+      name_selector: WAN_DHCP6
+      max_rtt: 100ms
+      keep_for: 30s
+      min_ttl: 1
+      ips:
+        - '2001:4860:4860::1888'

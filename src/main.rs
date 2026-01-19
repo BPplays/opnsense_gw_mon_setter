@@ -14,8 +14,16 @@ use trippy_core::{Builder, ProbeStatus, Round};
 
 #[derive(Debug, Deserialize)]
 struct Config {
-    #[serde(flatten)]
-    ifaces: HashMap<String, Vec<ProbeCfg>>,
+    pub api: ApiConfig,
+    pub ifaces: HashMap<String, Vec<ProbeCfg>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ApiConfig {
+    #[serde(rename = "type")]
+    pub atype: String,
+    pub key: String,
+    pub secret: String,
 }
 
 #[derive(Parser)]
@@ -346,6 +354,7 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
                 let cmp_idx = a.hops.partial_cmp(&b.hops).unwrap_or(std::cmp::Ordering::Equal);
                 cmp_idx
                     .then_with(|| a.avg_index.partial_cmp(&b.avg_index).unwrap_or(std::cmp::Ordering::Equal))
+                    .then_with(|| a.avg_rtt.partial_cmp(&b.avg_rtt).unwrap_or(std::cmp::Ordering::Equal))
                     .then_with(|| a.loss.total_cmp(&b.loss))
             });
 
