@@ -206,9 +206,15 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
             .unwrap_or(0);
         let index_count = max_index + 1;
 
-        // Build FIRST-SEEN ordered host list (chronological across rounds)
+        // Build FIRST-SEEN ordered host list (chronological across rounds).
+        // IMPORTANT: include each round.target so non-responding targets appear with 100% loss.
         let mut seen_hosts: Vec<IpAddr> = Vec::new();
         for round in snapshot.iter() {
+            // ensure target is present first (so the "target" shows up even if never Complete)
+            if !seen_hosts.iter().any(|h| h == &round.target) {
+                seen_hosts.push(round.target);
+            }
+            // then include any Complete responders seen in this round
             for probe_res in round.probes.iter() {
                 if let ProbeKind::Complete { host, .. } = &probe_res.kind {
                     if !seen_hosts.iter().any(|h| h == host) {
@@ -221,7 +227,7 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
         let host_count = seen_hosts.len();
 
         // Per-host accumulators indexed by host index:
-        // - times_present: number of rounds where host appeared at least once
+        // - times_present: number of rounds where host appeared at least once (Complete)
         // - index_sum: sum of the (closest) indices where the host appeared (for average position)
         // - rtts: list of RTT samples for avg RTT
         // - min_hops: minimum hops observed for host
@@ -239,7 +245,6 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
             for probe_res in round.probes.iter() {
                 if let ProbeKind::Complete { host, ttl: _, rtt } = &probe_res.kind {
                     if let Some(hidx) = seen_hosts.iter().position(|h| h == host) {
-                        // update closest index for this round
                         round_closest[hidx] = Some(match round_closest[hidx] {
                             Some(existing) => existing.min(probe_res.index),
                             None => probe_res.index,
@@ -280,7 +285,7 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
             if times_present[hidx] > 0 {
                 host_avg_index[hidx] = index_sum[hidx] as f64 / times_present[hidx] as f64;
             } else {
-                // host never seen -> place it at the far end
+                // host never seen (e.g. target that never replied) -> place it at the far end
                 host_avg_index[hidx] = f64::INFINITY;
             }
 
@@ -293,23 +298,25 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
 
         // --- For each configured probe, build candidates sorted by avg_index (closest -> furthest) ---
         for probe in probes.iter() {
-            // Build list of candidate tuples: (host, avg_rtt, loss, hops, avg_index)
+            // Build list of candidate tuples: (host, avg_rtt_opt, loss, hops, avg_index)
             let mut candidates: Vec<(IpAddr, Option<Duration>, f64, u32, f64)> = Vec::new();
             for (hidx, host) in seen_hosts.iter().enumerate() {
-                let avg_rtt = host_avg_rtt[hidx].unwrap_or_else(|| Duration::from_millis(0));
-                // still respect probe.max_rtt (skip hosts slower than allowed)
-                if avg_rtt > probe.max_rtt {
-                    continue;
+                // do not coerce missing RTT to 0 — keep Option so we can show "—"
+                let avg_rtt_opt = host_avg_rtt[hidx];
+                // respect probe.max_rtt: if a host has no RTT samples, we still include it (so failing targets show)
+                if let Some(avg_rtt) = avg_rtt_opt {
+                    if avg_rtt > probe.max_rtt {
+                        continue;
+                    }
                 }
                 let loss = host_loss[hidx];
                 let hops = min_hops[hidx].unwrap_or(255u32);
                 let avg_idx = host_avg_index[hidx];
-                candidates.push((*host, Some(avg_rtt), loss, hops, avg_idx));
+                candidates.push((*host, avg_rtt_opt, loss, hops, avg_idx));
             }
 
             // sort by average index ascending (closest first). tie-break by loss then hops.
             candidates.sort_by(|a, b| {
-                // compare avg_idx (f64), but handle INFINITY properly
                 let cmp_idx = a.4.partial_cmp(&b.4).unwrap_or(std::cmp::Ordering::Equal);
                 cmp_idx
                     .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
@@ -318,13 +325,15 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
 
             println!("iface={} probe={} candidates={}", ifname, probe.name, candidates.len());
             for (ip, avg_rtt_opt, loss, hops, avg_idx) in candidates.iter() {
-                // unwrap avg_rtt Option (we used Some above) for printing
-                let avg_rtt = avg_rtt_opt.unwrap_or_else(|| Duration::from_millis(0));
-                // print avg_index too for debugging
-                println!("  {} avg_rtt={:?} avg_loss={:.2}% hops={} avg_index={:.2}", ip, avg_rtt, loss, hops, avg_idx);
+                // show "—" for hosts with no RTT samples
+                let avg_rtt_str = match avg_rtt_opt {
+                    Some(d) => format!("{:?}", d),
+                    None => "—".to_string(),
+                };
+                println!("  {} avg_rtt={} avg_loss={:.2}% hops={} avg_index={:.2}", ip, avg_rtt_str, loss, hops, avg_idx);
             }
 
-            // print brief per-host summary for top N
+            // brief per-host summary for top N
             for (ip, _, loss, _, avg_idx) in candidates.iter().take(8) {
                 println!("  host {} loss={:.2}% avg_pos={:.2}", ip, loss, avg_idx);
             }
