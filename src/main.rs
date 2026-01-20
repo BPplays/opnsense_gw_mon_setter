@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, VecDeque, HashSet};
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
@@ -18,10 +18,34 @@ struct Config {
     pub ifaces: HashMap<String, Vec<ProbeCfg>>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiType {
+    Opnsense,
+}
+impl<'de> Deserialize<'de> for ApiType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // first get the string value
+        let s = String::deserialize(deserializer)?;
+        // normalize to ASCII lowercase for predictable matching
+        // use `to_lowercase()` if you need full Unicode case folding
+        match s.to_ascii_lowercase().as_str() {
+            "opnsense" => Ok(ApiType::Opnsense),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["opnsense", "mock", "foobar"],
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ApiConfig {
     #[serde(rename = "type")]
-    pub atype: String,
+    pub atype: ApiType,
     pub key: String,
     pub secret: String,
 }
