@@ -29,9 +29,6 @@ pub enum ApiType {
     #[strum(serialize = "opn")]
     #[strum(serialize = "opnsense-fw")]
     Opnsense,
-
-
-
 }
 
 impl<'de> Deserialize<'de> for ApiType {
