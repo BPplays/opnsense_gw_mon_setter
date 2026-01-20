@@ -1,5 +1,5 @@
 api:
-  type: 新opnsense
+  type: opnsense
   key: ""
   secret: ""
 

@@ -27,7 +27,6 @@ struct Config {
 pub enum ApiType {
     #[strum(serialize = "opnsense")]
     #[strum(serialize = "opn")]
-    #[strum(serialize = "opnsense-fw")]
     Opnsense,
 }
 
@@ -39,7 +38,6 @@ impl<'de> Deserialize<'de> for ApiType {
         let mut s = String::deserialize(deserializer)?;
         s = s.to_lowercase();
         ApiType::from_str(&s).map_err(|_e| {
-            // ApiType::VARIANTS comes from EnumVariantNames and is &'static [&'static str]
             serde::de::Error::unknown_variant(&s, &ApiType::VARIANTS)
         })
     }
