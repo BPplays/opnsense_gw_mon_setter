@@ -7,9 +7,9 @@ ifaces:
   eth4:
     - name: gw_main
       name_selector: WAN_DHCP6
-      max_rtt: 100ms
-      keep_for: 30s
-      min_ttl: 5
+      max_rtt: 300ms
+      keep_for: 100s
+      min_ttl: 2
       ips:
         - '::'
         - 'ffff::'
