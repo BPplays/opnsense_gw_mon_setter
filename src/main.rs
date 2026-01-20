@@ -120,34 +120,36 @@ fn main() -> Result<()> {
     let cfg: Config = serde_yaml::from_str(&yaml)?;
     println!("{:#?}", cfg.api);
 
-    // For each interface we create a shared list and spawn a tracer + aggregator thread pair.
     for (ifname, probes) in cfg.ifaces.into_iter() {
-        let shared: SharedList = Arc::new(Mutex::new(VecDeque::new()));
+        // iterate probes and create per-probe shared lists
+        for probe in probes.into_iter() {
+            // create a shared list JUST for this probe
+            let shared: SharedList = Arc::new(Mutex::new(VecDeque::new()));
 
-        // create distinct clones for each closure so we don't accidentally move `ifname`
-        let ifname_for_tracer = ifname.clone();
-        let ifname_for_aggregator = ifname.clone();
+            // clone what each closure needs
+            let ifname_for_tracer = ifname.clone();
+            let ifname_for_aggregator = ifname.clone();
 
-        // split probes for two closures (clone for tracer, move original into aggregator)
-        let probes_for_tracer = probes.clone();
-        let probes_for_aggregator = probes;
+            let probe_for_tracer = probe.clone();
+            let probe_for_aggregator = probe.clone();
 
-        let shared_for_tracer = shared.clone();
-        let shared_for_agg = shared.clone();
+            let shared_for_tracer = shared.clone();
+            let shared_for_agg = shared.clone();
 
-        // Tracer thread: cycles through configured probes for this interface.
-        thread::spawn(move || {
-            if let Err(e) = tracer_thread(ifname_for_tracer.clone(), probes_for_tracer, shared_for_tracer) {
-                eprintln!("tracer thread error for iface {}: {:#}", ifname_for_tracer, e);
-            }
-        });
+            // Tracer thread: only cycles through the single configured probe for this interface.
+            thread::spawn(move || {
+                if let Err(e) = tracer_thread(ifname_for_tracer.clone(), vec![probe_for_tracer.clone()], shared_for_tracer) {
+                    eprintln!("tracer thread error for iface {} probe {}: {:#}", ifname_for_tracer, probe_for_tracer.name, e);
+                }
+            });
 
-        // Aggregator thread: periodically checks shared list and prints best candidates per probe.
-        thread::spawn(move || {
-            if let Err(e) = aggregator_thread(ifname_for_aggregator.clone(), probes_for_aggregator, shared_for_agg) {
-                eprintln!("aggregator thread error for iface {}: {:#}", ifname_for_aggregator, e);
-            }
-        });
+            // Aggregator thread: periodically checks shared list and prints best candidates for this probe.
+            thread::spawn(move || {
+                if let Err(e) = aggregator_thread(ifname_for_aggregator.clone(), vec![probe_for_aggregator.clone()], shared_for_agg) {
+                    eprintln!("aggregator thread error for iface {} probe {}: {:#}", ifname_for_aggregator, probe_for_aggregator.name, e);
+                }
+            });
+        }
     }
 
     // keep main alive
@@ -178,7 +180,6 @@ fn tracer_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) -> R
                 let shared_cloned = shared.clone();
                 let keep_for = probe.keep_for;
 
-                // NOTE: max_rounds expects Option<usize>, not Option<u32>.
                 let max_rounds_one: Option<usize> = Some(1);
 
                 // Build tracer bound to interface and run exactly one round synchronously.
@@ -350,6 +351,7 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
 
         // --- For each configured probe, build candidates sorted by avg_index (closest -> furthest) ---
         for probe in probes.iter() {
+            let mut logs: Vec<String> = vec![];
             // Build list of candidate tuples: (host, avg_rtt_opt, loss, hops, avg_index)
             // let mut candidates: Vec<(IpAddr, Option<Duration>, f64, u32, f64)> = Vec::new();
             let mut candidates: Vec<Candidate> = Vec::new();
@@ -384,14 +386,21 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
                     .then_with(|| a.loss.total_cmp(&b.loss))
             });
 
-            println!("iface={} probe={} candidates={}", ifname, probe.name, candidates.len());
+            let s = format!(
+                "iface={} probe={} candidates={}",
+                ifname,
+                probe.name,
+                candidates.len(),
+            );
+            logs.push(s);
             for can in candidates.iter() {
                 // show "—" for hosts with no RTT samples
                 let avg_rtt_str = match can.avg_rtt {
                     Some(d) => format!("{:?}", d),
                     None => "—".to_string(),
                 };
-                println!(
+
+                let s = format!(
                     "  {} avg_rtt={} avg_loss={:.2}% hops={} avg_index={:.2}",
                     can.ip,
                     avg_rtt_str,
@@ -399,6 +408,7 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
                     can.hops,
                     can.avg_index,
                 );
+                logs.push(s);
             }
 
             // let mut winner = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
@@ -416,7 +426,7 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
                 if ttl < 255 { ttl += 1 }
 
                 if ttl < probe.min_ttl {
-                    println!("ttl too small {}", ttl);
+                    logs.push(format!("ttl too small {}", ttl));
                     continue;
                 }
                 if winner.ip.is_unspecified() {
@@ -432,7 +442,8 @@ fn aggregator_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) 
                     winner = can.clone()
                 }
             }
-            println!("winner! is {}", winner.ip)
+            logs.push(format!("[{}] winner is {}!", probe.name, winner.ip));
+            println!("{}", logs.join("\n"))
         }
     }
 }
