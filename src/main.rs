@@ -158,6 +158,7 @@ fn main() -> Result<()> {
     }
 }
 
+
 /// Tracer thread for a given interface:
 fn tracer_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) -> Result<()> {
     // default fallback list if probe doesn't provide ips
@@ -165,6 +166,9 @@ fn tracer_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) -> R
         "2620:fe::9".parse().unwrap(),
         "2001:4860:4860::8888".parse().unwrap(),
     ];
+
+    // remember last target across iterations so we can clear rounds when target changes
+    let mut last_target: Option<IpAddr> = None;
 
     loop {
         for probe in probes.iter() {
@@ -174,50 +178,93 @@ fn tracer_thread(ifname: String, probes: Vec<ProbeCfg>, shared: SharedList) -> R
 
             for target in ips_to_try.into_iter() {
                 println!("tracing: {}", target);
-                // had_result flag will be set inside the run_with closure if a TraceRound was produced/pushed
-                let had_result = Arc::new(AtomicBool::new(false));
-                let had_result_cloned = had_result.clone();
-                let shared_cloned = shared.clone();
-                let keep_for = probe.keep_for;
 
-                let max_rounds_one: Option<usize> = Some(1);
+                // If target changed since last time, clear shared rounds for a fresh start.
+                if last_target.map(|ip| ip != target).unwrap_or(true) {
+                    let mut q = shared.lock();
+                    q.clear();
+                }
+                last_target = Some(target);
 
-                // Build tracer bound to interface and run exactly one round synchronously.
-                let builder = Builder::new(target)
-                    .interface(Some(ifname.as_str()))
-                    .max_rounds(max_rounds_one);
+                // We'll re-run rounds for this target until we observe a round that
+                // contains NO Complete probe entries. Only then do we move to next IP.
+                //
+                // had_result: whether run_with pushed a TraceRound at all.
+                // had_complete: whether that TraceRound (the most recent one) contained any Complete probes.
+                loop {
+                    let had_result = Arc::new(AtomicBool::new(false));
+                    let had_result_cloned = had_result.clone();
 
-                match builder.build() {
-                    Ok(tracer) => {
-                        // run_with is synchronous and returns a Result — check it!
-                        let run_res = tracer.run_with(|round: &Round<'_>| {
-                            // convert the round to our owned TraceRound (always returns one even if no Complete)
-                            let tr = round_to_trace_round(round, probe.clone(), target);
-                            {
-                                let mut q = shared_cloned.lock();
-                                q.push_back(tr);
-                                let cutoff = chrono::Utc::now() - chrono::Duration::from_std(keep_for).unwrap();
-                                while q.front().map(|r| r.ts < cutoff).unwrap_or(false) {
-                                    q.pop_front();
+                    let had_complete = Arc::new(AtomicBool::new(false));
+                    let had_complete_cloned = had_complete.clone();
+
+                    let shared_cloned = shared.clone();
+                    let keep_for = probe.keep_for;
+
+                    let max_rounds_one: Option<usize> = Some(1);
+
+                    // Build tracer bound to interface and run exactly one round synchronously.
+                    let builder = Builder::new(target)
+                        .interface(Some(ifname.as_str()))
+                        .max_rounds(max_rounds_one);
+
+                    match builder.build() {
+                        Ok(tracer) => {
+                            // run_with is synchronous and returns a Result — check it!
+                            let run_res = tracer.run_with(|round: &Round<'_>| {
+                                // convert the round to our owned TraceRound (always returns one even if no Complete)
+                                let tr = round_to_trace_round(round, probe.clone(), target);
+
+                                let min_index = probe.min_ttl.saturating_sub(1) as usize;
+                                let contains_complete = tr.probes.iter().any(|p| {
+                                    p.index >= min_index && matches!(p.kind, ProbeKind::Complete { .. })
+                                });
+
+                                {
+                                    let mut q = shared_cloned.lock();
+                                    q.push_back(tr);
+                                    let cutoff = chrono::Utc::now() - chrono::Duration::from_std(keep_for).unwrap();
+                                    while q.front().map(|r| r.ts < cutoff).unwrap_or(false) {
+                                        q.pop_front();
+                                    }
+                                }
+
+                                had_result_cloned.store(true, Ordering::SeqCst);
+                                had_complete_cloned.store(contains_complete, Ordering::SeqCst);
+                            });
+
+                            match run_res {
+                                Ok(_) => {
+                                    // If run produced no result, move to next IP.
+                                    if !had_result.load(Ordering::SeqCst) {
+                                        break;
+                                    }
+
+                                    // If the most recent round had NO Complete entries -> move to next IP.
+                                    // Otherwise keep probing the same target.
+                                    if !had_complete.load(Ordering::SeqCst) {
+                                        break;
+                                    } else {
+                                        // There were Complete entries: retry the same target (per your requirement).
+                                        // small pause to avoid tight loop; adjust as needed
+                                        thread::sleep(Duration::from_millis(200));
+                                        continue;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("run_with returned Err for {} on iface {}: {:#}", target, ifname, e);
+                                    // On error, move to next IP
+                                    break;
                                 }
                             }
-                            had_result_cloned.store(true, Ordering::SeqCst);
-                        });
-
-                        match run_res {
-                            Ok(_) => {
-                                // println!("run_with returned Ok for {}", target);
-                                // move to next target (or next probe)
-                            }
-                            Err(e) => {
-                                eprintln!("run_with returned Err for {} on iface {}: {:#}", target, ifname, e);
-                            }
+                        }
+                        Err(e) => {
+                            eprintln!("failed to build tracer for {} on iface {}: {:#}", target, ifname, e);
+                            // On error, move to next IP
+                            break;
                         }
                     }
-                    Err(e) => {
-                        eprintln!("failed to build tracer for {} on iface {}: {:#}", target, ifname, e);
-                    }
-                }
+                } // end loop probing same target
 
             } // end for ips
 
