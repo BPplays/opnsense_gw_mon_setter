@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 use clap::{Parser};
+use std::str::FromStr;
+use strum::{VariantNames};
+use strum_macros::{AsRefStr, Display, EnumString, VariantNames};
 
 use trippy_core::{Builder, ProbeStatus, Round};
 
@@ -18,27 +21,30 @@ struct Config {
     pub ifaces: HashMap<String, Vec<ProbeCfg>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, EnumString, VariantNames, AsRefStr, Display, Serialize)]
+#[strum(serialize_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum ApiType {
+    #[strum(serialize = "opnsense")]
+    #[strum(serialize = "opn")]
+    #[strum(serialize = "opnsense-fw")]
     Opnsense,
+
+
+
 }
+
 impl<'de> Deserialize<'de> for ApiType {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        // first get the string value
-        let s = String::deserialize(deserializer)?;
-        // normalize to ASCII lowercase for predictable matching
-        // use `to_lowercase()` if you need full Unicode case folding
-        match s.to_ascii_lowercase().as_str() {
-            "opnsense" => Ok(ApiType::Opnsense),
-            other => Err(serde::de::Error::unknown_variant(
-                other,
-                &["opnsense", "mock", "foobar"],
-            )),
-        }
+        let mut s = String::deserialize(deserializer)?;
+        s = s.to_lowercase();
+        ApiType::from_str(&s).map_err(|_e| {
+            // ApiType::VARIANTS comes from EnumVariantNames and is &'static [&'static str]
+            serde::de::Error::unknown_variant(&s, &ApiType::VARIANTS)
+        })
     }
 }
 
@@ -117,6 +123,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let yaml = std::fs::read_to_string(cli.config)?;
     let cfg: Config = serde_yaml::from_str(&yaml)?;
+    println!("{:#?}", cfg.api);
 
     // For each interface we create a shared list and spawn a tracer + aggregator thread pair.
     for (ifname, probes) in cfg.ifaces.into_iter() {
